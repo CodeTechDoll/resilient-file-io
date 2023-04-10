@@ -1,8 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
-import multiprocessing as mp
-from multiprocessing import pool
 import os
 import mmap
 
