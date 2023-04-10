@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import multiprocessing as mp
@@ -6,17 +7,24 @@ import os
 import mmap
 
 
-def read_file_mmap(filepath, mode='r'):
-    with open(filepath, mode) as f:
+def read_file_mmap(filepath, mode='r', encoding='utf-8'):
+    with open(filepath, mode, encoding=encoding) as f:
+        file_size = os.stat(filepath).st_size
+        if file_size == 0:
+            return ""
         mmapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    return mmapped
+        try:
+            return mmapped.read().decode(encoding)
+        finally:
+            mmapped.close()
 
-
-def write_file_mmap(filepath, content, mode='w'):
-    with open(filepath, mode) as f:
+def write_file_mmap(filepath, content, mode='w', encoding='utf-8'):
+    with open(filepath, mode, encoding=encoding) as f:
         mmapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE)
-        mmapped.write(content.encode())
-        mmapped.close()
+        try:
+            mmapped.write(content.encode(encoding))
+        finally:
+            mmapped.close()
 
 
 def generate_hash(content, encoding='utf-8'):
@@ -25,14 +33,14 @@ def generate_hash(content, encoding='utf-8'):
     return sha256.hexdigest()
 
 
-def read_hash(filepath, encoding='utf-8'):
+def load_hash(filepath, encoding='utf-8'):
     if os.path.exists(filepath):
         with open(filepath, 'r', encoding=encoding) as f:
             return f.read().strip()
     return None
 
 
-def write_hash(filepath, hash_value, encoding='utf-8'):
+def save_hash(filepath, hash_value, encoding='utf-8'):
     with open(filepath, 'w', encoding=encoding) as f:
         f.write(hash_value)
 
@@ -41,26 +49,47 @@ def save_progress(progress_file, progress, encoding='utf-8'):
     with open(progress_file, 'w', encoding=encoding) as f:
         json.dump(progress, f)
 
-
 def load_progress(progress_file, encoding='utf-8'):
-    if os.path.exists(progress_file):
-        with open(progress_file, 'r', encoding=encoding) as f:
-            return json.load(f)
-    return None
+    if not os.path.exists(progress_file):
+        return None
+    with open(progress_file, 'r', encoding=encoding) as f:
+        content = f.read()
+        if not content:
+            return None
+        return json.loads(content)
 
-
-def save_with_checkpoints_mmap(filepath, content, checkpoint_size=1024, encoding='utf-8'):
+def save_with_checkpoints(filepath, content, processing_function, checkpoint_size=1024, encoding='utf-8', num_workers=4):
     total_size = len(content)
     last_saved = 0
 
+    # Read the saved content from the file and update the last_saved position
     if os.path.exists(filepath):
         saved_content = read_file_mmap(filepath)
         last_saved = len(saved_content)
 
-    write_file_mmap(filepath, content[last_saved:], 'a')
+    # Open the output file in append mode
+    with open(filepath, 'a', encoding=encoding) as f:
+        # Create a ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Continue processing while the last_saved position is less than the total_size of the content
+            while last_saved < total_size:
+                end_pos = min(last_saved + checkpoint_size, total_size)
+                
+                # Create sub-chunks of content to be processed in parallel
+                sub_chunks = [(content[i:i + checkpoint_size], processing_function) for i in range(last_saved, end_pos, checkpoint_size)]
+                
+                # Use the executor to map the process_sub_chunk function to the sub_chunks
+                results = list(executor.map(lambda args: process_sub_chunk(*args), sub_chunks))
 
-    return last_saved + len(content[last_saved:])  # Return the actual saved position
+                # Write the processed results to the output file
+                for result in results:
+                    f.write(result)
 
+                # Update the last_saved position
+                last_saved = end_pos
+
+    # Return the actual saved position
+    return last_saved
 
 def process_chunk(chunk, processing_function, output_dict):
     chunk_size = len(chunk)
@@ -73,10 +102,14 @@ def process_chunk(chunk, processing_function, output_dict):
 
     output_dict[chunk] = processed_chunk  # Save the processed chunk to the shared dictionary
 
+def process_sub_chunk(sub_chunk, processing_function):
+    return processing_function(sub_chunk)
 
-def resume_checkpoint(input_file, output_file, hash_file, progress_file, processing_function, encoding='utf-8', num_workers=4):
-    progress = load_progress(progress_file, encoding)
+def resume_checkpoint(input_file, output_file, hash_file, progress_file, processing_function):
+    # Load the progress file
+    progress = load_progress(progress_file)
 
+    # If progress is `None`, it means that the progress file doesn't exist so create a new progress dictionary
     if progress is None:
         progress = {
             'last_saved': 0,
@@ -84,48 +117,36 @@ def resume_checkpoint(input_file, output_file, hash_file, progress_file, process
         }
 
     try:
-        with open(input_file, 'r+b') as f:
-            processed_content = mmap.mmap(f.fileno(), 0)
-            if progress['total_size'] is None:
-                progress['total_size'] = len(processed_content)
-                save_progress(progress_file, progress, encoding)
+        processed_content = processing_function(input_file) # Process the content from the input file using the provided `processing_function`
 
-            with mp.Manager() as manager:
-                pool_results = []
-                output_dict = manager.dict()
+        # Generate the hash of the processed content
+        content_hash = generate_hash(processed_content) 
+        saved_hash = load_hash(hash_file) # Load the saved hash from the hash file
 
-                chunk_size = progress['total_size'] // num_workers
-                start_positions = [i * chunk_size for i in range(num_workers)]
-                end_positions = start_positions[1:] + [progress['total_size']]
 
-                for i in range(num_workers):
-                    start_pos = start_positions[i]
-                    end_pos = end_positions[i]
-                    if start_pos >= progress['last_saved']:
-                        pool_results.append(pool.apply_async(process_chunk, (processed_content[start_pos:end_pos], processing_function, output_dict)))
-                    else:
-                        pool_results.append(None)
+        if saved_hash is None: # Check if the saved hash is `None` or if it matches the generated hash
 
-                while progress['last_saved'] < progress['total_size']:
-                    for i in range(num_workers):
-                        if pool_results[i] and pool_results[i].ready():
-                            pool_results[i].get()
-                            pool_results[i] = None
-                            output_pos = save_with_checkpoints(output_file, output_dict, end_positions[i], encoding)
-                            if i == num_workers - 1 or output_pos >= end_positions[i]:
-                                progress['last_saved'] = end_positions[i]
-                                save_progress(progress_file, progress, encoding)
-                                if progress['last_saved'] >= progress['total_size']:
-                                    # Compute and save the hash of the processed content to the hash file
-                                    hash_value = generate_hash(processed_content[:progress['total_size']], encoding)
-                                    write_hash(hash_file, hash_value, encoding)
-                                    print("Finished processing and saved the output.")
-                                    os.remove(progress_file)  # Remove the progress file when the process is completed successfully
-                            else:
-                                pool_results[i] = pool.apply_async(process_chunk, (processed_content[end_positions[i]:start_positions[i+1]], processing_function, output_dict))
+            save_hash(hash_file, content_hash)
+        elif saved_hash != content_hash: # If the saved hash doesn't match the generated hash, raise an error
 
-            pool.close()
-            pool.join()
+            raise ValueError("Hash mismatch. Processed content might have been tampered with.")
+        if progress['total_size'] is None: # If the saved hash matches the generated hash, continue processing the content
 
-    except Exception as e:
+
+            progress['total_size'] = len(processed_content) # If the total size is `None`, it means that the progress file doesn't exist so save the total size
+            save_progress(progress_file, progress)
+            
+        # Save the processed content to the output file
+        while progress['last_saved'] < progress['total_size']: # While the last saved position is less than the total size, save the processed content to the output file
+            progress['last_saved'] = save_with_checkpoints(output_file, processed_content, progress['last_saved']) # Save the processed content to the output file in chunks
+
+            save_progress(progress_file, progress) # Save the progress to the progress file
+
+            if progress['last_saved'] >= progress['total_size']: # Check if the last saved position is greater than or equal to the total size
+
+
+                print("Finished processing and saved the output.") # If the last saved position is greater than or equal to the total size, it means that the processing is complete
+                if os.path.exists(progress_file): # Check if the progress file exists before trying to remove it
+                    os.remove(progress_file)
+    except (FileNotFoundError, ValueError, IOError) as e: # Catch specific exceptions
         print(f"Error occurred: {e}. Please restart the script to resume.")
