@@ -1,6 +1,8 @@
 # Resilient File IO
 
 Resilient File IO is a Python library that provides a set of utility functions to handle file input/output operations with resilience against interruptions or errors. It includes features such as saving progress, hashing, and resuming from checkpoints, which can be useful in a variety of applications.
+# CURRENT STATUS - BROKEN
+I am working on adding parallelization to the processing of large files in order to speed up efficiency but am a total noob doing this so please be patient as I learn and update this library's functionality.
 
 ## Features
 
